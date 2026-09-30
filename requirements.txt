@@ -1,0 +1,3 @@
+pyvmomi>=8.0.0
+# Only needed for --run windows / --run all (in-guest checks via WinRM):
+pywinrm>=0.4.3
