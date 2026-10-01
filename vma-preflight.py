@@ -352,12 +352,45 @@ def _describe_object(obj) -> str:
     return f"{cls} '{getattr(obj, 'name', '?')}'"
 
 
+def _inventory_path_of(obj) -> str:
+    """Walk parent chain to build a human-readable vSphere inventory path.
+    Returns something like 'MyDC/vm/Production/web-01'. Falls back to .name."""
+    try:
+        parts: List[str] = []
+        cur = obj
+        safety = 32
+        while cur is not None and safety > 0:
+            name = getattr(cur, "name", None)
+            if not name:
+                break
+            parts.append(name)
+            cur = getattr(cur, "parent", None)
+            safety -= 1
+        # Trim the top-most "Datacenters" root folder that vSphere adds.
+        if parts and parts[-1].lower() in ("datacenters", "vcenter"):
+            parts.pop()
+        return "/".join(reversed(parts)) or getattr(obj, "name", "?")
+    except Exception:
+        return getattr(obj, "name", "?")
+
+
+def _get_vm_parent_folder(vm):
+    """Walk up from a VM to its nearest Folder parent (skipping vApp etc.)."""
+    from pyVmomi import vim
+    cur = getattr(vm, "parent", None)
+    while cur is not None:
+        if isinstance(cur, vim.Folder):
+            return cur
+        cur = getattr(cur, "parent", None)
+    return None
+
+
 # ===========================================================================
 # MODE 1 - PREFLIGHT (existing checks A/B/C/D/E)
 # ===========================================================================
 def check_vcenter_preflight(
     host, port, user, password, insecure, vm_names, timeout,
-    folder_paths=None,
+    folder_paths=None, per_vm_privs=False,
 ) -> Optional[List[str]]:
     from pyVim.connect import Disconnect
 
@@ -377,7 +410,7 @@ def check_vcenter_preflight(
         content = si.RetrieveContent()
 
     head("B. vCenter privileges required by VMA")
-    _check_privileges(content, vm_names, folder_paths)
+    _check_privileges(content, vm_names, folder_paths, per_vm_privs)
 
     head("C. ESXi host discovery (for VMs to migrate)")
     esxi_hosts = _discover_esxi_hosts(content, vm_names)
@@ -389,7 +422,20 @@ def check_vcenter_preflight(
     return esxi_hosts
 
 
-def _check_privileges(content, vm_names, folder_paths=None):
+def _check_privileges(content, vm_names, folder_paths=None, per_vm_privs=False):
+    """Check VMA-required privileges, folder-first.
+
+    Entity selection (in order):
+      1) Explicit --folder paths, if any.
+      2) Else: auto-infer the parent Folder of each --vm NAME (deduped).
+      3) Else: vCenter root folder.
+
+    When --per-vm-privs is also set, VMs are additionally checked individually
+    (useful for diagnosing broken propagation on specific VMs).
+
+    Entities with identical 'missing privileges' sets are collapsed into a
+    single output group so a role gap shared by N VMs lists the gap ONCE.
+    """
     from pyVmomi import vim
 
     auth_mgr = content.authorizationManager
@@ -403,38 +449,61 @@ def _check_privileges(content, vm_names, folder_paths=None):
         return False
     PASS("Authenticated principal", user)
 
-    # Build the list of entities to check permissions against.
-    # Precedence:
-    #   1) --folder paths, if any (checked first, since roles are usually granted here)
-    #   2) --vm names, if any
-    #   3) fallback: vCenter root folder
+    # ---------- Build entity list ----------
     entities: List[Tuple[str, object]] = []
 
     if folder_paths:
         for path in folder_paths:
             obj = find_inventory_object(content, path)
             if obj is not None:
-                entities.append((f"{_describe_object(obj)} (path '{path}')", obj))
+                entities.append((f"{_describe_object(obj)} (path '{_inventory_path_of(obj)}')", obj))
             else:
                 WARN(
                     f"Locate folder '{path}'",
                     "not found in inventory; use full path like 'Datacenter/vm/Production' "
                     "or the exact folder / datacenter / cluster name",
                 )
-
-    if vm_names:
+    elif vm_names:
+        # Auto-infer parent folders from the VM list; dedupe.
+        seen_folders: Dict[str, Tuple[object, List[str]]] = {}
+        missing_vms: List[str] = []
         for name in vm_names:
             vm = find_vm(content, name)
-            if vm is not None:
-                entities.append((f"VM '{name}'", vm))
+            if vm is None:
+                missing_vms.append(name)
+                continue
+            folder = _get_vm_parent_folder(vm)
+            if folder is None:
+                # VM with no proper folder (vApp-only, standalone) - fall back to VM itself
+                entities.append((f"VM '{name}' (no parent folder; checking VM directly)", vm))
+                continue
+            key = _inventory_path_of(folder)
+            if key not in seen_folders:
+                seen_folders[key] = (folder, [name])
             else:
-                WARN(f"Locate VM '{name}'", "not found in inventory; skipping per-VM permission check")
+                seen_folders[key][1].append(name)
+        for key, (folder, vms) in seen_folders.items():
+            vm_hint = f"inferred from {len(vms)} VM(s): {', '.join(vms[:5])}"
+            if len(vms) > 5:
+                vm_hint += f", +{len(vms) - 5} more"
+            entities.append((f"{_describe_object(folder)} (path '{key}', {vm_hint})", folder))
+        for name in missing_vms:
+            WARN(f"Locate VM '{name}'", "not found in inventory; skipping")
 
     if not entities:
         entities.append(("vCenter root folder", content.rootFolder))
 
+    # Also check each VM individually when the operator asks for it.
+    if per_vm_privs and vm_names:
+        for name in vm_names:
+            vm = find_vm(content, name)
+            if vm is not None:
+                entities.append((f"VM '{name}'", vm))
+
+    # ---------- Run the actual privilege check ----------
     priv_ids = list(VMA_REQUIRED_PRIVILEGES.keys())
-    all_missing: Dict[str, List[str]] = {}
+    # Map each entity label -> frozenset(missing_privilege_ids). Empty frozenset = all present.
+    per_entity_missing: Dict[str, frozenset] = {}
 
     for label, ent in entities:
         try:
@@ -450,20 +519,35 @@ def _check_privileges(content, vm_names, folder_paths=None):
         except Exception as e:  # noqa: BLE001
             FAIL(f"Privilege check on {label}", f"{type(e).__name__}: {e}")
             continue
+        missing = frozenset(priv_ids[i] for i, has in enumerate(result) if not has)
+        per_entity_missing[label] = missing
 
-        missing = [priv_ids[i] for i, has in enumerate(result) if not has]
-        if not missing:
-            PASS(f"All {len(priv_ids)} required privileges present on {label}")
+    # ---------- Group by identical missing-set so we print each gap once ----------
+    groups: Dict[frozenset, List[str]] = {}
+    for label, miss in per_entity_missing.items():
+        groups.setdefault(miss, []).append(label)
+
+    all_ok = True
+    for miss, labels in groups.items():
+        if not miss:
+            # All required privs present for this group
+            if len(labels) == 1:
+                PASS(f"All {len(priv_ids)} required privileges present on {labels[0]}")
+            else:
+                PASS(f"All {len(priv_ids)} required privileges present on {len(labels)} entities",
+                     ", ".join(labels[:3]) + (f", +{len(labels)-3} more" if len(labels) > 3 else ""))
         else:
-            all_missing[label] = missing
-
-    if not all_missing:
-        return True
-    for label, missing in all_missing.items():
-        FAIL(f"Missing privileges on {label}", f"{len(missing)} of {len(priv_ids)} missing")
-        for pid in missing:
-            print(f"      - {C.RED}{pid}{C.RST}  ({VMA_REQUIRED_PRIVILEGES[pid]})")
-    return False
+            all_ok = False
+            header = (f"{len(labels)} entity/entities missing {len(miss)} of {len(priv_ids)} privilege(s)"
+                      if len(labels) > 1
+                      else f"Missing privileges on {labels[0]}")
+            FAIL(header, f"{len(miss)} of {len(priv_ids)} missing")
+            if len(labels) > 1:
+                for lbl in labels:
+                    print(f"      • {lbl}")
+            for pid in sorted(miss):
+                print(f"      - {C.RED}{pid}{C.RST}  ({VMA_REQUIRED_PRIVILEGES[pid]})")
+    return all_ok
 
 
 def _discover_esxi_hosts(content, vm_names):
@@ -841,7 +925,13 @@ def run_windows_checks(
             if vm is None:
                 FAIL(f"Locate VM '{name}'", "not found in vCenter inventory"); continue
 
-            print(f"\n  {C.BLD}Windows VM: {name}{C.RST}")
+            # Skip non-Windows guests cleanly - no point probing WinRM on Linux.
+            is_win, guest_label = _guest_is_windows(vm)
+            if not is_win:
+                SKIP(f"[{name}] Windows checks", f"guest is not Windows ({guest_label})")
+                continue
+
+            print(f"\n  {C.BLD}Windows VM: {name}{C.RST}  (detected: {guest_label})")
 
             # Resolve a reachable address for WinRM.
             addr = _pick_guest_address(vm)
@@ -884,6 +974,32 @@ def run_windows_checks(
             Disconnect(si)
         except Exception:
             pass
+
+
+def _guest_is_windows(vm) -> Tuple[bool, str]:
+    """Return (is_windows, short_label) for a VM.
+
+    Prefers VMware Tools' guestFamily when available; falls back to the
+    configured guestId. Returns a human-readable label for the summary line.
+    """
+    g = getattr(vm, "guest", None)
+    fam = (getattr(g, "guestFamily", "") or "").lower() if g else ""
+    gid = (getattr(vm.config, "guestId", "") or "")
+    gfull = (getattr(vm.config, "guestFullName", "") or getattr(g, "guestFullName", "")) if g else gid
+
+    if fam == "windowsguest":
+        return True, f"guestFamily=windowsGuest, '{gfull or gid}'"
+    if fam in ("linuxguest", "othernixosguestfamily", "darwinguestfamily",
+               "netwareguest", "solarisguest", "othernonlinuxguest"):
+        return False, f"guestFamily={fam}, '{gfull or gid}'"
+
+    # Tools may not be running - fall back to configured guestId.
+    low = gid.lower()
+    if "windows" in low or low.startswith("win"):
+        return True, f"guestId={gid or 'unknown'}"
+    if gid:
+        return False, f"guestId={gid}"
+    return False, "guest OS unknown (Tools not running and no guestId)"
 
 
 def _pick_guest_address(vm) -> Optional[str]:
@@ -1175,6 +1291,7 @@ MODE_INFO: Dict[str, Dict[str, Any]] = {
         "summary": "auth, VMA-required privileges, ESXi discovery, DNS, TCP 443/902",
         "required": ["--vcenter", "--user", "(--password | VC_PASSWORD | prompt)"],
         "optional": ["--vm NAME | --vm-file PATH", "--folder PATH  (repeatable)",
+                     "--per-vm-privs  (also check each VM individually)",
                      "--esxi HOST", "--insecure",
                      "--skip-dns", "--skip-ports", "--timeout N"],
         "example": (
@@ -1468,8 +1585,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "vSphere inventory path (or bare folder / datacenter / cluster name) to check "
-            "VMA privileges on. Repeatable. Example: 'MyDC/vm/Production'. If given, the "
-            "root-folder fallback is not used. Coexists with --vm (both get checked)."
+            "VMA privileges on. Repeatable. Example: 'MyDC/vm/Production'. If given, "
+            "privileges are checked here instead of inferring from --vm parents."
+        ),
+    )
+    p.add_argument(
+        "--per-vm-privs",
+        action="store_true",
+        help=(
+            "ALSO check VMA privileges on each --vm individually, on top of the folder-scope "
+            "check. Useful for diagnosing broken role propagation on specific VMs. "
+            "Default off (folder-scope only, since role grants almost always live at a folder)."
         ),
     )
     p.add_argument("--esxi", action="append", default=[], metavar="HOST", help="Extra ESXi host for DNS + 902 checks.")
@@ -1583,6 +1709,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             insecure=args.insecure, vm_names=args.vm or None,
             timeout=args.timeout,
             folder_paths=args.folder or None,
+            per_vm_privs=args.per_vm_privs,
         )
         if discovered:
             for h in discovered:
